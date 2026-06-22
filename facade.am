@@ -1,0 +1,427 @@
+namespace Amalgame.Net.Pop3
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Crypto
+import Amalgame.Database.SQLite
+import Amalgame.Net.Mail
+import Amalgame.Tls
+
+@c {
+    #include <string.h>
+    #include <sys/socket.h>
+    #include <unistd.h>
+}
+
+// ═══════════════════════════════════════════════════════
+//  pop3.am  —  POP3 server (RFC 1939 + STLS RFC 2595)
+// ═══════════════════════════════════════════════════════
+//
+// Phase 5 of the native Amalgame mail server. The legacy download-and-go
+// access protocol: a client logs in, downloads messages, optionally
+// deletes them. Reads an `amalgame-net-mail-store` MailStore.
+//
+//   Pop3Session — the POP3 command state machine. Pure logic: feed it a
+//                 line, get the response back. No socket, no TLS →
+//                 unit-testable with strings.
+//   Pop3Server  — the TcpServer accept loop + STLS upgrade (same
+//                 transport as amalgame-net-smtp-server / -imap).
+//
+// AUTH (USER/PASS) verifies scrypt hashes via amalgame-crypto
+// Password.Verify (one unified account). Credentials are refused before
+// STLS (no passwords in the clear).
+//
+// Message numbers are positional (1..N over the mailbox UID order, taken
+// at login); DELE marks for deletion and QUIT applies it (UPDATE state).
+// RETR/TOP output is dot-stuffed and terminated with CRLF "." CRLF.
+//
+// Out of scope (v0.1.0): APOP, a worker pool (one connection at a time),
+// implicit TLS on :995.
+
+public class Pop3Session {
+    public  Store:     MailStore
+    public  Users:     Map<string, string>
+    public  Mailbox:   string
+    public  TlsActive: bool
+    public  Authed:    bool
+    public  AuthUser:  string
+
+    private PendUser:  string         // USER name awaiting PASS
+    private Msgs:      List<int>      // uid per message number (index+1)
+    private Deleted:   List<bool>     // marked-for-deletion, parallel to Msgs
+    private Upgrade:   bool
+    private Quit:      bool
+
+    public Pop3Session(store: MailStore, host: string) {
+        this.Store     = store
+        this.Users     = new Map<string, string>()
+        this.Mailbox   = "INBOX"
+        this.TlsActive = false
+        this.Authed    = false
+        this.AuthUser  = ""
+        this.PendUser  = ""
+        this.Msgs      = new List<int>()
+        this.Deleted   = new List<bool>()
+        this.Upgrade   = false
+        this.Quit      = false
+    }
+
+    public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
+    public void AddUserHash(string name, string hash)      { this.Users.Set(name, hash) }
+    public bool IsQuit() { return this.Quit }
+    public bool WantsTlsUpgrade() { return this.Upgrade }
+    public void SetTlsActive(bool on) { this.TlsActive = on; this.Upgrade = false }
+
+    public string Greeting() { return "+OK Amalgame POP3 ready\r\n" }
+
+    public string Feed(string line) {
+        let verb: string = String_ToUpper(Pop3Session.token(line, 0))
+        let arg1: string = Pop3Session.token(line, 1)
+        let arg2: string = Pop3Session.token(line, 2)
+
+        if (verb == "CAPA") { return this.capa() }
+        if (verb == "STLS") {
+            if (this.TlsActive) { return "-ERR Already using TLS\r\n" }
+            this.Upgrade = true
+            return "+OK Begin TLS negotiation\r\n"
+        }
+        if (verb == "QUIT") { return this.quit() }
+        if (verb == "USER") {
+            if (!this.TlsActive) { return "-ERR [AUTH] STLS required before USER\r\n" }
+            this.PendUser = arg1
+            return "+OK\r\n"
+        }
+        if (verb == "PASS") { return this.pass(line) }
+        if (verb == "NOOP") { return "+OK\r\n" }
+
+        // transaction-state commands
+        if (!this.Authed) { return "-ERR not authenticated\r\n" }
+        if (verb == "STAT") { return this.stat() }
+        if (verb == "LIST") { return this.listing(arg1, false) }
+        if (verb == "UIDL") { return this.listing(arg1, true) }
+        if (verb == "RETR") { return this.retr(arg1) }
+        if (verb == "TOP")  { return this.top(arg1, arg2) }
+        if (verb == "DELE") { return this.dele(arg1) }
+        if (verb == "RSET") { return this.rset() }
+        return "-ERR unknown command\r\n"
+    }
+
+    // ── handlers ──────────────────────────────────────
+
+    private string capa() {
+        var out: string = "+OK Capability list follows\r\n"
+        out = out + "USER\r\nUIDL\r\nTOP\r\n"
+        if (!this.TlsActive) { out = out + "STLS\r\n" }
+        return out + ".\r\n"
+    }
+
+    private string pass(string line) {
+        if (!this.TlsActive) { return "-ERR [AUTH] STLS required before PASS\r\n" }
+        if (String_Length(this.PendUser) == 0) { return "-ERR USER required first\r\n" }
+        let pw: string = Pop3Session.after(line, 1)
+        let user: string = this.PendUser
+        if (this.Users.Has(user) && Password.Verify(pw, this.Users.Get(user))) {
+            this.Authed = true
+            this.AuthUser = user
+            this.Msgs = this.Store.Uids(this.Mailbox)
+            this.Deleted = new List<bool>()
+            let n: int = this.Msgs.Count()
+            for i in 0..n { this.Deleted.Add(false) }
+            return "+OK mailbox ready, " + String_FromInt(n) + " messages\r\n"
+        }
+        this.PendUser = ""
+        return "-ERR authentication failed\r\n"
+    }
+
+    private string quit() {
+        // UPDATE state: apply deletions.
+        if (this.Authed) {
+            let n: int = this.Msgs.Count()
+            for i in 0..n {
+                if (this.Deleted.Get(i)) {
+                    let uid: int = this.Msgs.Get(i)
+                    this.Store.Delete(this.Mailbox, uid)
+                }
+            }
+        }
+        this.Quit = true
+        return "+OK Amalgame POP3 signing off\r\n"
+    }
+
+    private string stat() {
+        var count: int = 0
+        var total: int = 0
+        let n: int = this.Msgs.Count()
+        for i in 0..n {
+            if (!this.Deleted.Get(i)) {
+                count = count + 1
+                total = total + this.Store.Size(this.Mailbox, this.Msgs.Get(i))
+            }
+        }
+        return "+OK " + String_FromInt(count) + " " + String_FromInt(total) + "\r\n"
+    }
+
+    // LIST/UIDL: with an arg → single line; without → multi-line list.
+    private string listing(string arg, bool uidl) {
+        if (String_Length(arg) > 0) {
+            let num: int = String_ToInt(arg)
+            if (!this.live(num)) { return "-ERR no such message\r\n" }
+            let uid: int = this.Msgs.Get(num - 1)
+            if (uidl) { return "+OK " + String_FromInt(num) + " " + String_FromInt(uid) + "\r\n" }
+            let sz: int = this.Store.Size(this.Mailbox, uid)
+            return "+OK " + String_FromInt(num) + " " + String_FromInt(sz) + "\r\n"
+        }
+        var out: string = "+OK\r\n"
+        let n: int = this.Msgs.Count()
+        for i in 0..n {
+            if (!this.Deleted.Get(i)) {
+                let num: int = i + 1
+                let uid: int = this.Msgs.Get(i)
+                if (uidl) { out = out + String_FromInt(num) + " " + String_FromInt(uid) + "\r\n" }
+                else { out = out + String_FromInt(num) + " " + String_FromInt(this.Store.Size(this.Mailbox, uid)) + "\r\n" }
+            }
+        }
+        return out + ".\r\n"
+    }
+
+    private string retr(string arg) {
+        let num: int = String_ToInt(arg)
+        if (!this.live(num)) { return "-ERR no such message\r\n" }
+        let uid: int = this.Msgs.Get(num - 1)
+        let body: string = this.Store.Read(this.Mailbox, uid)
+        let sz: int = String_Length(body)
+        let stuffed: string = Pop3Session.dotStuff(body)
+        return "+OK " + String_FromInt(sz) + " octets\r\n" + stuffed + "\r\n.\r\n"
+    }
+
+    // TOP n m: headers + the first m body lines.
+    private string top(string arg, string arg2) {
+        let num: int = String_ToInt(arg)
+        if (!this.live(num)) { return "-ERR no such message\r\n" }
+        let lines: int = String_ToInt(arg2)
+        let uid: int = this.Msgs.Get(num - 1)
+        let body: string = this.Store.Read(this.Mailbox, uid)
+        let head: string = Pop3Session.headPlusLines(body, lines)
+        let stuffed: string = Pop3Session.dotStuff(head)
+        return "+OK\r\n" + stuffed + "\r\n.\r\n"
+    }
+
+    private string dele(string arg) {
+        let num: int = String_ToInt(arg)
+        if (num < 1 || num > this.Msgs.Count()) { return "-ERR no such message\r\n" }
+        if (this.Deleted.Get(num - 1)) { return "-ERR message already deleted\r\n" }
+        this.Deleted.Set(num - 1, true)
+        return "+OK message " + String_FromInt(num) + " deleted\r\n"
+    }
+
+    private string rset() {
+        let n: int = this.Msgs.Count()
+        for i in 0..n { this.Deleted.Set(i, false) }
+        return "+OK\r\n"
+    }
+
+    // ── helpers ───────────────────────────────────────
+
+    private bool live(int num) {
+        if (num < 1 || num > this.Msgs.Count()) { return false }
+        return !this.Deleted.Get(num - 1)
+    }
+
+    // RFC 1939 byte-stuffing: a line starting with "." gets an extra ".".
+    private static string dotStuff(string msg) {
+        var m: string = String_Replace(msg, "\r\n.", "\r\n..")
+        if (String_Length(m) > 0 && String_CharAt1(m, 0) == ".") { m = "." + m }
+        return m
+    }
+
+    // Headers (up to the blank line) + the first `n` body lines.
+    private static string headPlusLines(string msg, int n) {
+        let sep: int = String_IndexOf(msg, "\r\n\r\n")
+        if (sep < 0) { return msg }
+        let head: string = String_Substring(msg, 0, sep + 4)
+        let bodyStart: int = sep + 4
+        let body: string = String_Substring(msg, bodyStart, String_Length(msg) - bodyStart)
+        var out: string = head
+        var taken: int = 0
+        var rest: string = body
+        while (taken < n && String_Length(rest) > 0) {
+            let nl: int = String_IndexOf(rest, "\r\n")
+            if (nl < 0) { out = out + rest; rest = "" }
+            else {
+                out = out + String_Substring(rest, 0, nl + 2)
+                rest = String_Substring(rest, nl + 2, String_Length(rest) - nl - 2)
+            }
+            taken = taken + 1
+        }
+        return out
+    }
+
+    private static string token(string s, int idx) {
+        let parts: List<string> = Pop3Session.splitWs(s)
+        if (idx < 0 || idx >= parts.Count()) { return "" }
+        return parts.Get(idx)
+    }
+    private static string after(string s, int n) {
+        var i: int = 0
+        var seen: int = 0
+        let len: int = String_Length(s)
+        while (i < len && Pop3Session.isWs(String_CharAt1(s, i))) { i = i + 1 }
+        while (seen < n && i < len) {
+            while (i < len && !Pop3Session.isWs(String_CharAt1(s, i))) { i = i + 1 }
+            while (i < len && Pop3Session.isWs(String_CharAt1(s, i))) { i = i + 1 }
+            seen = seen + 1
+        }
+        if (i >= len) { return "" }
+        return String_Substring(s, i, len - i)
+    }
+    private static List<string> splitWs(string s) {
+        let out: List<string> = new List<string>()
+        let len: int = String_Length(s)
+        var i: int = 0
+        while (i < len) {
+            while (i < len && Pop3Session.isWs(String_CharAt1(s, i))) { i = i + 1 }
+            if (i >= len) { break }
+            let start: int = i
+            while (i < len && !Pop3Session.isWs(String_CharAt1(s, i))) { i = i + 1 }
+            out.Add(String_Substring(s, start, i - start))
+        }
+        return out
+    }
+    private static bool isWs(string c) { return c == " " || c == "\t" }
+}
+
+// ── Transport: TcpServer accept loop + STLS ───────────────
+public class Pop3Server {
+    public  Store:   MailStore
+    public  Users:   Map<string, string>
+    public  Host:    string
+    private Cert:    string
+    private Key:     string
+    private HasCert: bool
+
+    public Pop3Server(store: MailStore, host: string) {
+        this.Store = store
+        this.Users = new Map<string, string>()
+        this.Host = host
+        this.Cert = ""
+        this.Key = ""
+        this.HasCert = false
+    }
+    public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
+    public void AddUserHash(string name, string hash)      { this.Users.Set(name, hash) }
+    public Pop3Server WithCert(string certPath, string keyPath) {
+        this.Cert = certPath; this.Key = keyPath; this.HasCert = true; return this
+    }
+
+    public void Serve(int port) {
+        let srv = TcpServer_Listen(port, 64)
+        while (TcpServer_IsListening(srv)) {
+            let conn = TcpServer_Accept(srv)
+            if (TcpConn_IsConnected(conn)) {
+                var fd: int = -1
+                @c { fd = ((AmalgameTcpConn*) conn)->_fd; }
+                this.handle(fd)
+            }
+        }
+        TcpServer_Close(srv)
+    }
+
+    private void handle(int fd) {
+        let sess: Pop3Session = new Pop3Session(this.Store, this.Host)
+        let keys: List<string> = this.Users.Keys()
+        let nk: int = keys.Count()
+        for i in 0..nk {
+            let k: string = keys.Get(i)
+            let v: string = this.Users.Get(k)
+            sess.AddUserHash(k, v)
+        }
+        Pop3Server.sendFd(fd, sess.Greeting())
+
+        var buf: string = ""
+        var phase: int = 0
+        while (phase == 0) {
+            let nl: int = String_IndexOf(buf, "\n")
+            if (nl < 0) {
+                let chunk: string = Pop3Server.recvFd(fd, 4096)
+                if (String_Length(chunk) == 0) { phase = 1 }
+                else { buf = buf + chunk }
+            } else {
+                let line: string = Pop3Server.lineAt(buf, nl)
+                buf = String_Substring(buf, nl + 1, String_Length(buf) - nl - 1)
+                let resp: string = sess.Feed(line)
+                if (String_Length(resp) > 0) { Pop3Server.sendFd(fd, resp) }
+                if (sess.IsQuit()) { phase = 1 }
+                else if (sess.WantsTlsUpgrade()) { phase = 2 }
+            }
+        }
+        if (phase == 2 && this.HasCert) {
+            let cfg0: TlsConfig = TlsConfig.Default()
+            let cfg:  TlsConfig = TlsConfig.WithCertFile(cfg0, this.Cert, this.Key)
+            let ctx:  TlsContext = TlsContext.Server(cfg)
+            let tls:  TlsStream = TlsStream.Wrap(fd, ctx, true)
+            let hs:   bool = TlsStream.Handshake(tls)
+            if (hs) {
+                sess.SetTlsActive(true)
+                var tbuf: string = ""
+                var done: bool = false
+                while (!done) {
+                    let nl: int = String_IndexOf(tbuf, "\n")
+                    if (nl < 0) {
+                        let chunk: string = Pop3Server.recvTls(tls, 4096)
+                        if (String_Length(chunk) == 0) { done = true }
+                        else { tbuf = tbuf + chunk }
+                    } else {
+                        let line: string = Pop3Server.lineAt(tbuf, nl)
+                        tbuf = String_Substring(tbuf, nl + 1, String_Length(tbuf) - nl - 1)
+                        let resp: string = sess.Feed(line)
+                        if (String_Length(resp) > 0) { Pop3Server.sendTls(tls, resp) }
+                        if (sess.IsQuit()) { done = true }
+                    }
+                }
+            }
+            TlsStream.Close(tls)
+        }
+        @c { close((int) fd); }
+    }
+
+    private static string lineAt(string buf, int nl) {
+        var line: string = String_Substring(buf, 0, nl)
+        let ll: int = String_Length(line)
+        if (ll > 0) {
+            let last: string = String_CharAt1(line, ll - 1)
+            if (last == "\r") { line = String_Substring(line, 0, ll - 1) }
+        }
+        return line
+    }
+    private static string recvFd(int fd, int max) {
+        var r: string = ""
+        @c {
+            char* b = (char*) GC_MALLOC((size_t) max + 1);
+            long n = (long) recv((int) fd, b, (size_t) max, 0);
+            if (n > 0) { b[n] = 0; r = (code_string) b; }
+        }
+        return r
+    }
+    private static bool sendFd(int fd, string data) {
+        var ok: bool = false
+        @c { long n = (long) send((int) fd, data, strlen(data), 0); ok = (n >= 0); }
+        return ok
+    }
+    private static string recvTls(tls: TlsStream, max: int) {
+        var r: string = ""
+        @c {
+            char* b = (char*) GC_MALLOC((size_t) max + 1);
+            i64 n = Amalgame_Tls_TlsStream_ReadBytes((AmalgameTlsStream*) tls, b, (i64) max);
+            if (n > 0) { b[n] = 0; r = (code_string) b; }
+        }
+        return r
+    }
+    private static bool sendTls(tls: TlsStream, data: string) {
+        var ok: bool = false
+        @c {
+            i64 n = Amalgame_Tls_TlsStream_WriteBytes((AmalgameTlsStream*) tls, data, (i64) strlen(data));
+            ok = (n >= 0);
+        }
+        return ok
+    }
+}

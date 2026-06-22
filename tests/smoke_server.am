@@ -1,0 +1,24 @@
+// Smoke fixture: real POP3 server on 127.0.0.1:2528 over a temp store
+// preloaded with one message, STLS (self-signed cert), one account.
+// Driven by tests/smoke_test.sh (Python poplib: STLS→USER/PASS→RETR).
+
+namespace Smoke
+
+import Amalgame.Collections
+import Amalgame.Database.SQLite
+import Amalgame.Tls
+import Amalgame.Net.Mail
+import Amalgame.Net.Pop3
+
+public class Program {
+    public static void Main(string[] args) {
+        let base: string = "/tmp/amalgame-pop3-smoke"
+        let store: MailStore = MailStore.Open(base + "/store")
+        let uid: int = store.Deliver("INBOX", "Subject: Smoke\r\nFrom: s@e.com\r\n\r\nhello pop3 smoke")
+        let srv: Pop3Server = new Pop3Server(store, "pop.test")
+        srv.AddPassword("alice", "s3cret")
+        let srv2: Pop3Server = srv.WithCert(base + "/cert.pem", base + "/key.pem")
+        Console.WriteLine("SMOKE-SERVER-READY")
+        srv2.Serve(2528)
+    }
+}

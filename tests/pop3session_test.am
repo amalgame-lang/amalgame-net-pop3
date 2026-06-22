@@ -1,0 +1,98 @@
+// Test suite for amalgame-net-pop3 — the Pop3Session state machine,
+// driven with strings against a real local MailStore (no socket, no TLS;
+// SetTlsActive(true) simulates post-STLS).
+
+namespace Tests
+
+import Amalgame.Collections
+import Amalgame.IO.Filesystem
+import Amalgame.Database.SQLite
+import Amalgame.Tls
+import Amalgame.Net.Mail
+import Amalgame.Net.Pop3
+
+public class Program {
+    public static void Main(string[] args) {
+        let root: string = "/tmp/amalgame-pop3-test"
+        Filesystem.Remove(root)
+        let store: MailStore = MailStore.Open(root)
+        let u1: int = store.Deliver("INBOX", "Subject: One\r\n\r\n.dotline\r\nbody one")
+        let u2: int = store.Deliver("INBOX", "Subject: Two\r\n\r\nbody two")
+
+        let s: Pop3Session = new Pop3Session(store, "pop.test")
+        s.AddPassword("alice", "s3cret")
+
+        // 1. greeting
+        let g: string = s.Greeting()
+        if (String_Contains(g, "+OK")) { Console.WriteLine("[PASS] greeting") }
+        else { Console.WriteLine("[FAIL] greeting: " + g) }
+
+        // 2. CAPA advertises STLS pre-tls
+        let cp: string = s.Feed("CAPA")
+        if (String_Contains(cp, "+OK") && String_Contains(cp, "STLS") && String_Contains(cp, ".\r\n")) { Console.WriteLine("[PASS] capa") }
+        else { Console.WriteLine("[FAIL] capa: " + cp) }
+
+        // 3. USER refused before STLS
+        let u0: string = s.Feed("USER alice")
+        if (String_Contains(u0, "-ERR")) { Console.WriteLine("[PASS] user refused pre-tls") }
+        else { Console.WriteLine("[FAIL] user refused pre-tls: " + u0) }
+
+        s.SetTlsActive(true)
+
+        // 4. USER + PASS success
+        let ru: string = s.Feed("USER alice")
+        let rp: string = s.Feed("PASS s3cret")
+        let authed: bool = s.Authed
+        if (String_Contains(ru, "+OK") && String_Contains(rp, "+OK") && authed) { Console.WriteLine("[PASS] user/pass success") }
+        else { Console.WriteLine("[FAIL] user/pass: " + ru + " | " + rp) }
+
+        // 5. PASS failure (separate session)
+        let s2: Pop3Session = new Pop3Session(store, "pop.test")
+        s2.AddPassword("alice", "s3cret")
+        s2.SetTlsActive(true)
+        let x1: string = s2.Feed("USER alice")
+        let x2: string = s2.Feed("PASS wrong")
+        if (String_Contains(x2, "-ERR")) { Console.WriteLine("[PASS] pass failure") }
+        else { Console.WriteLine("[FAIL] pass failure: " + x2) }
+
+        // 6. STAT
+        let stt: string = s.Feed("STAT")
+        if (String_Contains(stt, "+OK 2 ")) { Console.WriteLine("[PASS] stat") }
+        else { Console.WriteLine("[FAIL] stat: " + stt) }
+
+        // 7. LIST multi-line
+        let ls: string = s.Feed("LIST")
+        if (String_Contains(ls, "+OK") && String_Contains(ls, "1 ") && String_Contains(ls, "2 ") && String_Contains(ls, "\r\n.\r\n")) { Console.WriteLine("[PASS] list") }
+        else { Console.WriteLine("[FAIL] list: " + ls) }
+
+        // 8. UIDL maps number→uid
+        let ud: string = s.Feed("UIDL")
+        if (String_Contains(ud, "1 " + String_FromInt(u1)) && String_Contains(ud, "2 " + String_FromInt(u2))) { Console.WriteLine("[PASS] uidl") }
+        else { Console.WriteLine("[FAIL] uidl: " + ud) }
+
+        // 9. RETR with dot-stuffing + terminator
+        let rt: string = s.Feed("RETR 1")
+        if (String_Contains(rt, "+OK") && String_Contains(rt, "octets")
+            && String_Contains(rt, "body one") && String_Contains(rt, "..dotline")
+            && String_Contains(rt, "\r\n.\r\n")) { Console.WriteLine("[PASS] retr dot-stuffed") }
+        else { Console.WriteLine("[FAIL] retr: " + rt) }
+
+        // 10. DELE then STAT reflects 1 live
+        let dl: string = s.Feed("DELE 1")
+        let st2: string = s.Feed("STAT")
+        if (String_Contains(dl, "+OK") && String_Contains(st2, "+OK 1 ")) { Console.WriteLine("[PASS] dele marks") }
+        else { Console.WriteLine("[FAIL] dele: " + dl + " | " + st2) }
+
+        // 11. RETR of deleted message → -ERR
+        let rtd: string = s.Feed("RETR 1")
+        if (String_Contains(rtd, "-ERR")) { Console.WriteLine("[PASS] retr deleted err") }
+        else { Console.WriteLine("[FAIL] retr deleted err: " + rtd) }
+
+        // 12. QUIT applies deletion to the store
+        let q: string = s.Feed("QUIT")
+        let cnt: int = store.Count("INBOX")
+        let isq: bool = s.IsQuit()
+        if (String_Contains(q, "+OK") && isq && cnt == 1) { Console.WriteLine("[PASS] quit applies delete") }
+        else { Console.WriteLine("[FAIL] quit: " + q + " | count=" + String_FromInt(cnt)) }
+    }
+}

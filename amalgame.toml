@@ -1,0 +1,37 @@
+# Package manifest — amalgame-net-pop3
+#
+# POP3 server (RFC 1939 + STLS RFC 2595) for the native Amalgame mail
+# server (Phase 5): download-and-go access to an amalgame-net-mail-store
+# MailStore. Two layers: Pop3Session (the command state machine — pure
+# logic, socket/TLS-free, unit-testable) and Pop3Server (TcpServer accept
+# loop + STLS upgrade via amalgame-tls). USER/PASS verifies scrypt hashes
+# via amalgame-crypto Password.Verify (one unified account); refused
+# before STLS.
+#
+# See Amalgame/docs/proposals/native-mail-server.md.
+#
+# Installation:
+#
+#   amc package add net-pop3
+#   amc package add github.com/amalgame-lang/amalgame-net-pop3@v0.1.0
+
+[package]
+name              = "amalgame-net-pop3"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "POP3 server (RFC 1939 + STLS) for the native Amalgame mail server: Pop3Session state machine (USER/PASS/STAT/LIST/UIDL/RETR/TOP/DELE/RSET/QUIT) + Pop3Server TCP/TLS loop, reading an amalgame-net-mail-store. AUTH via scrypt (amalgame-crypto)."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.72"
+schema-version    = 1
+
+[dependencies]
+amalgame-net-mail-store = ">=0.1.0"
+amalgame-crypto         = ">=0.6.0"
+amalgame-tls            = ">=0.3.5"
+
+[stdlib]
+classes   = ["Pop3Session", "Pop3Server"]
+header    = "facade-stub.h"
+namespace = "Amalgame.Net.Pop3"
+facade    = "facade.am"
+libs      = []

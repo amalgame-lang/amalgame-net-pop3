@@ -115,6 +115,7 @@ check "[PASS] retr dot-stuffed"
 check "[PASS] dele marks"
 check "[PASS] retr deleted err"
 check "[PASS] quit applies delete"
+check "[PASS] pass lockout"
 echo "$OUT" | grep -q "\[FAIL\]" && FAIL=$((FAIL+1))
 echo "────────────────────────────────────────────"
 echo -e "  ${GREEN}PASS: $PASS${NC}  |  ${RED}FAIL: $FAIL${NC}"

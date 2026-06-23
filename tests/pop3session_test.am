@@ -94,5 +94,20 @@ public class Program {
         let isq: bool = s.IsQuit()
         if (String_Contains(q, "+OK") && isq && cnt == 1) { Console.WriteLine("[PASS] quit applies delete") }
         else { Console.WriteLine("[FAIL] quit: " + q + " | count=" + String_FromInt(cnt)) }
+
+        // 13. AUTH brute-force lockout
+        let lk: Pop3Session = new Pop3Session(store, "pop.test")
+        lk.AddPassword("alice", "s3cret")
+        lk.SetTlsActive(true)
+        var lkf: int = 0
+        for i in 0..5 {
+            let ru: string = lk.Feed("USER alice")
+            let rp: string = lk.Feed("PASS wrongpass")
+            if (String_Contains(rp, "-ERR")) { lkf = lkf + 1 }
+        }
+        let lku: string = lk.Feed("USER alice")
+        let lkd: string = lk.Feed("PASS s3cret")
+        if (lkf == 5 && String_Contains(lkd, "too many")) { Console.WriteLine("[PASS] pass lockout") }
+        else { Console.WriteLine("[FAIL] pass lockout: lkf=" + String_FromInt(lkf) + " r=" + lkd) }
     }
 }

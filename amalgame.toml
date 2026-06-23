@@ -17,7 +17,7 @@
 
 [package]
 name              = "amalgame-net-pop3"
-version           = "0.2.0"
+version           = "0.2.1"
 license           = "Apache-2.0"
 description       = "POP3 server (RFC 1939 + STLS) for the native Amalgame mail server: Pop3Session state machine (USER/PASS/STAT/LIST/UIDL/RETR/TOP/DELE/RSET/QUIT) + Pop3Server TCP/TLS loop, reading an amalgame-net-mail-store. AUTH via scrypt (amalgame-crypto)."
 authors           = ["Bastien Mouget"]

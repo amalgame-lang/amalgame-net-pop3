@@ -52,6 +52,8 @@ public class Pop3Session {
     private Deleted:   List<bool>     // marked-for-deletion, parallel to Msgs
     private Upgrade:   bool
     private Quit:      bool
+    private AuthFails: int            // failed PASS attempts (brute-force lockout)
+    private MaxAuthFails: int
 
     public Pop3Session(store: MailStore, host: string) {
         this.Store     = store
@@ -65,6 +67,8 @@ public class Pop3Session {
         this.Deleted   = new List<bool>()
         this.Upgrade   = false
         this.Quit      = false
+        this.AuthFails = 0
+        this.MaxAuthFails = 5
     }
 
     public void AddPassword(string name, string plaintext) { this.Users.Set(name, Password.Hash(plaintext)) }
@@ -119,11 +123,13 @@ public class Pop3Session {
     private string pass(string line) {
         if (!this.TlsActive) { return "-ERR [AUTH] STLS required before PASS\r\n" }
         if (String_Length(this.PendUser) == 0) { return "-ERR USER required first\r\n" }
+        if (this.AuthFails >= this.MaxAuthFails) { return "-ERR [AUTH] too many failures\r\n" }
         let pw: string = Pop3Session.after(line, 1)
         let user: string = this.PendUser
         if (this.Users.Has(user) && Password.Verify(pw, this.Users.Get(user))) {
             this.Authed = true
             this.AuthUser = user
+            this.AuthFails = 0
             this.Msgs = this.Store.Uids(this.Mailbox)
             this.Deleted = new List<bool>()
             let n: int = this.Msgs.Count()
@@ -131,6 +137,7 @@ public class Pop3Session {
             return "+OK mailbox ready, " + String_FromInt(n) + " messages\r\n"
         }
         this.PendUser = ""
+        this.AuthFails = this.AuthFails + 1
         return "-ERR authentication failed\r\n"
     }
 

@@ -371,6 +371,17 @@ public class Pop3Server {
 
     private void handleTls(int fd) {
         if (!this.HasCert) { @c { close((int) fd); } return }
+        Pop3Server.setRecvTimeout(fd, 60)
+        // Anti-corruption : port TLS implicite dès l'accept. Des scanners
+        // envoient du HTTP brut ici (même signature que l'incident IMAPS
+        // 2026-08-26/27, "ROOTEVIDENCE/1.0" sur :993) — jamais un ClientHello
+        // valide. On vérifie l'octet de type d'enregistrement TLS avant
+        // d'appeler Handshake().
+        if (!Pop3Server.looksLikeTls(fd)) {
+            Console.WriteLine("[pop3-tls-reject] host=" + this.Host + " — octets non-TLS sur port implicite, fermé avant handshake")
+            @c { close((int) fd); }
+            return
+        }
         let sess: Pop3Session = new Pop3Session(this.Store, this.Host)
         sess.Resolver = this.Resolver
         let keys: List<string> = this.Users.Keys()
@@ -380,7 +391,6 @@ public class Pop3Server {
             let v: string = this.Users.Get(k)
             sess.AddUserHash(k, v)
         }
-        Pop3Server.setRecvTimeout(fd, 60)
         let cfg0: TlsConfig = TlsConfig.Default()
         let cfg:  TlsConfig = TlsConfig.WithCertFile(cfg0, this.Cert, this.Key)
         let ctx:  TlsContext = TlsContext.Server(cfg)
@@ -485,6 +495,20 @@ public class Pop3Server {
             tv.tv_sec = (long) secs; tv.tv_usec = 0;
             setsockopt((int) fd, SOL_SOCKET, SO_RCVTIMEO, (const void*) &tv, sizeof(tv));
         }
+    }
+
+    // Regarde (sans consommer, MSG_PEEK) le premier octet reçu : un vrai
+    // ClientHello TLS commence toujours par 0x16 (record type Handshake).
+    // setRecvTimeout() doit avoir été appelé avant (sinon un client muet
+    // bloque ce peek indéfiniment).
+    private static bool looksLikeTls(int fd) {
+        var ok: bool = false
+        @c {
+            unsigned char b0 = 0;
+            long n = (long) recv((int) fd, &b0, 1, MSG_PEEK);
+            ok = (n == 1 && b0 == 0x16);
+        }
+        return ok
     }
     private static string recvFd(int fd, int max) {
         var r: string = ""
